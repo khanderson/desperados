@@ -4,16 +4,27 @@ module Rados #:nodoc:
   module Lib #:nodoc:
     extend FFI::Library
 
-    ffi_lib 'rados'
+    # Some quasi-typedefs for clarity, I can't get Library#typedef to work at all.
+    RADOS_T = :pointer
+    RADOS_IOCTX_T = :pointer
+ 
+    ffi_lib 'rados.so.2'
 
-    attach_function 'rados_initialize', [ :int, :varargs ], :int
-    attach_function 'rados_deinitialize', [], :void
-    attach_function 'rados_open_pool', [:string, :pointer], :int
-    attach_function 'rados_create_pool', [:string], :int
-    attach_function 'rados_write', [:pointer, :string, :off_t, :buffer_in, :size_t], :int
-    attach_function 'rados_read', [:pointer, :string, :off_t, :pointer, :size_t], :int
-    attach_function 'rados_remove', [:pointer, :string], :int
-    attach_function 'rados_delete_pool', [:pointer], :int
+    attach_function 'rados_create', [:pointer, :string], :int
+    attach_function 'rados_shutdown', [RADOS_T], :void
+    attach_function 'rados_conf_read_file', [RADOS_T, :string], :int
+    attach_function 'rados_conf_set', [RADOS_T, :string, :string], :int
+    attach_function 'rados_connect', [RADOS_T], :int
+    attach_function 'rados_ioctx_create', [RADOS_T, :string, :pointer], :int
+    attach_function 'rados_ioctx_destroy', [RADOS_IOCTX_T], :void
+    attach_function 'rados_write', [RADOS_IOCTX_T, :string, :buffer_in, :size_t, :off_t], :int
+    attach_function 'rados_write_full', [RADOS_IOCTX_T, :string, :buffer_in, :size_t], :int
+    attach_function 'rados_read', [RADOS_IOCTX_T, :string, :pointer, :size_t, :off_t], :int
+    attach_function 'rados_remove', [RADOS_IOCTX_T, :string], :int
+    attach_function 'rados_pool_create', [RADOS_T, :string], :int
+    attach_function 'rados_pool_delete', [RADOS_T, :string], :int
+
+    attach_function 'strerror', [:int], :string
   end
 
   class RadosError < StandardError ; end
@@ -25,15 +36,44 @@ module Rados #:nodoc:
 
   # Initialize the Rados library. Must be called once before any other
   # operations.
-  def self.initialize
-    unless @initialized
-      ret = Lib.rados_initialize(0)
-      if ret < 0 # Blocked by ceph bug #512
-        raise RadosError, "Could not initialize rados: #{ret}"
+  def self.initialize(options = {})
+    # Handle some options explictly, others get forwarded to rados_conf_set.
+    user, conf_file = options.delete(:user), options.delete(:config_file)
+
+    unless initialized?
+      handle_ptr = FFI::MemoryPointer.new Lib::RADOS_T
+      trap_error("initializing rados") { Lib.rados_create(handle_ptr, user) }
+      handle = handle_ptr.get_pointer(0)
+
+      begin
+        conf_file_desc = conf_file ? conf_file.inspect : "from default location"
+
+        # NB. passing NULL to rados_conf_read_file makes librados use defaults.
+        trap_error("loading config file #{conf_file_desc}") do
+          Lib.rados_conf_read_file(handle, conf_file)
+        end
+
+        # Let explicit config options override values from the config file.
+        options.each do |option, value|
+          trap_error("applying config option '#{option}'",
+                     Errno::ENOENT::Errno => "'#{option}' is not a valid option") do
+            Lib.rados_conf_set(handle, option.to_s, value.to_s)
+          end
+        end
+
+        trap_error("connecting to rados") { Lib.rados_connect(handle) }
+
+        @handle_ptr = handle_ptr
+      rescue
+        Lib.rados_shutdown(handle)
+        raise
       end
-      @initialized = true
     end
-    @initialized
+  end
+
+  def self.handle
+    @handle_ptr or raise RadosError, "Not connected"
+    @handle_ptr.get_pointer(0)
   end
 
   # A Rados::Object represents an object in a pool in a cluster.
@@ -116,11 +156,15 @@ module Rados #:nodoc:
       p
     end
 
+    def self.handle
+      Rados.handle
+    end
+
     # Create a new pool in the cluster with the given name. Returns a
     # Pool instance. Raises a RadosError exception if the pool could
     # not be created.
     def self.create(name)
-      ret = Lib.rados_create_pool(name)
+      ret = Lib.rados_pool_create(handle, name)
       if ret < 0
         raise RadosError, "creating pool #{name}"
       else
@@ -130,20 +174,28 @@ module Rados #:nodoc:
 
     # The internal Rados pool data stucture
     def pool #:nodoc:
-      return @pool unless @pool.nil?
-      @pool_pointer = FFI::MemoryPointer.new :pointer
-      ret = Lib.rados_open_pool name, @pool_pointer
-      if ret < 0
-        raise PoolNotFound, name
+      pool_ptr or raise RadosError, "Pool is not initialized"
+      pool_ptr.get_pointer(0)
+    end
+
+    def pool_ptr
+      @pool_ptr ||= begin
+        pool_ptr = FFI::MemoryPointer.new Lib::RADOS_IOCTX_T
+
+        ret = Lib.rados_ioctx_create self.class.handle, name, pool_ptr
+        if ret < 0
+          raise PoolNotFound, name
+        end
+
+        pool_ptr
       end
-      @pool = @pool_pointer.get_pointer(0)
     end
 
     # Destroy the pool. Raises a RadosError exception if the pool
     # could not be deleted.
     def destroy
       sanity_check "destroy already"
-      ret = Lib.rados_delete_pool(pool)
+      ret = Lib.rados_pool_delete(self.class.handle, @name)
       if ret < 0
         raise RadosError, "deleting pool #{name}"
       else
@@ -172,7 +224,7 @@ module Rados #:nodoc:
       sanity_check "write to"
       offset = options.fetch(:offset, 0)
       len = options.fetch(:size, buf.size)
-      ret = Lib.rados_write(pool, oid, offset, buf, len)
+      ret = Lib.rados_write(pool, oid, buf, len, offset)
       if ret < 0
         raise WriteError, "writing #{len} bytes at offset #{offset} to #{oid} in pool #{name}: #{ret}"
       elsif ret < len
@@ -194,7 +246,7 @@ module Rados #:nodoc:
       offset = options.fetch(:offset, 0)
       len = options.fetch(:size, 8192)
       buf = FFI::MemoryPointer.new :char, len
-      ret = Lib.rados_read(pool, oid, offset, buf, len)
+      ret = Lib.rados_read(pool, oid, buf, len, offset)
       if ret == -2
         raise ObjectNotFound, "reading from '#{oid}' in pool #{name}"
       elsif ret < 0
@@ -220,5 +272,19 @@ module Rados #:nodoc:
     def sanity_check(action)
       raise RadosError, "attempt to #{action} destroyed pool #{name}" if destroyed?
     end      
+  end
+
+  private
+
+  # A wrapper for processing the return value of rados library calls.
+  def self.trap_error(context = "accessing rados", description_overrides = {})
+    if (ret = yield) < 0
+      error_desc = description_overrides.fetch(-ret, Lib.strerror(-ret))
+      raise RadosError, "Error while #{context}: #{error_desc}"
+    end
+  end
+
+  def self.initialized?
+    @handle_ptr
   end
 end
