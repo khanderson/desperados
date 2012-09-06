@@ -23,8 +23,6 @@ module Rados #:nodoc:
     attach_function 'rados_remove', [RADOS_IOCTX_T, :string], :int
     attach_function 'rados_pool_create', [RADOS_T, :string], :int
     attach_function 'rados_pool_delete', [RADOS_T, :string], :int
-
-    attach_function 'strerror', [:int], :string
   end
 
   class RadosError < StandardError ; end
@@ -277,10 +275,10 @@ module Rados #:nodoc:
   private
 
   # A wrapper for processing the return value of rados library calls.
-  def self.trap_error(context = "accessing rados", description_overrides = {})
+  def self.trap_error(context = "accessing rados", message_overrides = {})
     if (ret = yield) < 0
-      error_desc = description_overrides.fetch(-ret, Lib.strerror(-ret))
-      raise RadosError, "Error while #{context}: #{error_desc}"
+      message = message_overrides.fetch(-ret, SystemCallError.new(-ret).message)
+      raise RadosError, "Error while #{context}: #{message}"
     end
   end
 
