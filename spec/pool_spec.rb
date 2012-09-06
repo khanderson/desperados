@@ -112,6 +112,13 @@ describe Pool do
       @pool.write(oid, "123456789")
       @pool.read(oid, :size => 5).should == "12345"
     end
+
+    it "should return the entire object data for large objects" do
+      oid = an_oid
+      data = "0123456789" * 100 * 33  # Just over 32KB.
+      @pool.write(oid, data)
+      @pool.read(oid).should == data
+    end
   end
 
   describe "#remove" do

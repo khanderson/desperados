@@ -231,15 +231,44 @@ module Rados #:nodoc:
       ret
     end
 
-    # Reads data from the object id <tt>oid</tt> in the pool.  Returns
-    # the data as a string. If no object with the oid exists, a
+    # Reads object data from the object id <tt>oid</tt> in the pool.
+    # Returns the data as a string. If no object with the oid exists, a
+    # Rados::ObjectNotFound exception is raised. If the read fails
+    # then a Rados::ReadError exception is raised.
+    #
+    # Available options are:
+    # * <tt>:size</tt> - The maximum amount of data to read, defaults to reading the entire object.
+    # * <tt>:offset</tt> - The number of bytes from the beginning of the object to start writing at. Defaults to 0.
+    # * <tt>:chunk_size</tt> - The number of bytes to read in each call to librados, defaults to 32KB.
+    def read(oid, options = {})
+      size = options[:size]
+      offset = options.fetch(:offset, 0)
+      chunk_size = options.fetch(:chunk_size, 32768)
+
+      parts = []
+
+      while size.nil? || size > 0
+        more_data = read_part(oid, :offset => offset, :size => [chunk_size, size].compact.min)
+        bytes_read = more_data.bytesize
+        break if bytes_read == 0
+
+        size -= bytes_read if size
+        offset += bytes_read
+        parts << more_data
+      end
+
+      parts.join
+    end
+
+    # Reads up to a fixed number of bytes of data from the object id <tt>oid</tt> in the pool.
+    # Returns the data as a string. If no object with the oid exists, a
     # Rados::ObjectNotFound exception is raised. If the read fails
     # then a Rados::ReadError exception is raised.
     #
     # Available options are:
     # * <tt>:size</tt> - The amount of data to read. As objects can be huge, it is unlikely that you'll want to load the entire thing into ram, so defaults to 8192 bytes.
     # * <tt>:offset</tt> - The number of bytes from the beginning of the object to start writing at. Defaults to 0.
-    def read(oid, options = {})
+    def read_part(oid, options = {})
       sanity_check "read from"
       offset = options.fetch(:offset, 0)
       len = options.fetch(:size, 8192)
